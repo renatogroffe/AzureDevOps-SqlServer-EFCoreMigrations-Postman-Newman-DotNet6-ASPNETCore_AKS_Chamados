@@ -1,0 +1,25 @@
+apiVersion : apps/v1
+kind: Deployment
+metadata:
+  name: chamadossuporte 
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chamadossuporte
+  template:
+    metadata:
+      labels:
+        app: chamadossuporte 
+    spec:
+      containers:
+        - name: chamadossuporte 
+          image: groffeazuredevops.azurecr.io/chamadossuporte
+          ports:
+          - containerPort: 80
+          env:
+          - name: ConnectionStrings__BaseSuporte
+            valueFrom:
+              secretKeyRef:
+                name: apisuporte-secret
+                key: SqlConnection

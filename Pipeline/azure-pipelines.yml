@@ -1,0 +1,203 @@
+trigger:
+- main
+
+resources:
+  containers:
+    - container: sqlserver
+      image: mcr.microsoft.com/mssql/server:2019-latest
+      networks: 
+      - testes
+      env:
+        SA_PASSWORD: SqlServer2019!
+        ACCEPT_EULA: Y
+        MSSQL_PID: Developer
+      ports:
+        - 1433:1433
+
+variables:
+
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: 'ID CONNECTION'
+  imageRepository: 'chamadossuporte'
+  containerRegistry: 'resource.azurecr.io'
+  dockerfilePath: '**/Dockerfile'
+  tag: '$(Build.BuildId)'
+  imagePullSecret: 'secretname'
+
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+  # Variáveis para execução dos testes de integração
+  File_Log_Execution_WebApp: 'log-execution-restapi.log'
+  Path_Project: './APISuporte'
+  Dll_Project: 'APISuporte.dll'
+  Path_Tests: './Tests'
+  Collection_Postman: 'ChamadosSuporte.postman_collection.json'
+  Iterations: 10
+  BaseSuporteConnectionString: 'Server=127.0.0.1,1433;Database=BaseSuporte;User Id=sa;Password=SqlServer2019!;TrustServerCertificate=True;'
+  appsettings_Path: './APISuporte/appsettings.json'
+  
+stages:
+- stage: BuildAndTests
+  displayName: Build and Tests stage
+  jobs:
+  - job: BuildAndTests
+    displayName: BuildAndTests
+    pool:
+      vmImage: $(vmImageName)
+    services:
+      sqlserver: sqlserver
+    steps:
+    - script: |
+        docker images
+        docker container ls
+      displayName: Exibir imagens e container em execução
+    - script: |
+        cd /opt/mssql-tools/bin/
+        ls
+        sleep 10s
+        sqlcmd -S "127.0.0.1,1433" -U sa -P SqlServer2019! -d master -Q "CREATE DATABASE BaseSuporte"
+        echo 'BaseSuporte criada com sucesso!'
+      displayName: Criar banco BaseSuporte
+    - task: Docker@2
+      displayName: Build da imagem
+      inputs:
+        containerRegistry: '$(dockerRegistryServiceConnection)'
+        repository: '$(imageRepository)'
+        command: 'build'
+        Dockerfile: '**/Dockerfile'
+        tags: |
+          $(tag)
+          latest
+    - task: replacetokens@5
+      inputs:
+        targetFiles: '$(appsettings_Path)'
+        encoding: 'auto'
+        tokenPattern: 'default'
+        writeBOM: true
+        actionOnMissing: 'warn'
+        keepToken: false
+        actionOnNoFiles: 'continue'
+        enableTransforms: false
+        enableRecursion: false
+        useLegacyPattern: false
+        defaultValue: '$(BaseSuporteConnectionString)'
+        enableTelemetry: true
+      displayName: Configurar a string de conexão do SQL Server no appsettings.json
+    - script: cat $(appsettings_Path)
+      displayName: Exibir conteúdo do appsettings.json
+    - script: |
+        echo '*** SDKs do .NET intalados ***'
+        dotnet --list-sdks
+        echo '*** Versão assumida como default para o .NET ***'
+        dotnet --version
+        echo '*** Instalar EF Core Tools ***'
+        dotnet tool install --global dotnet-ef
+        dotnet ef
+      displayName: Instalar EF Core Tools
+    - script: |
+        cd $(Path_Project)
+        dotnet ef migrations add IntegrationTests
+        dotnet ef database update
+        echo 'Migrations do Entity Framework Core executadas com sucesso'
+      displayName: Executar Migrations criando a tabela de Chamados
+    - script: |
+        dotnet publish $(Path_Project) -c Release -o app
+        cd ./app
+        nohup dotnet $(Dll_Project) > $(File_Log_Execution_WebApp) 2>&1 &
+        echo 'Aguardando a inicialização da aplicação a ser testada...'
+        sleep 10s
+      displayName: Executar a aplicação a ser testada em background (nohup)
+      env:
+        ASPNETCORE_URLS: 'http://localhost:5000'
+    - script: |
+        cd $(Path_Tests)
+        newman run $(Collection_Postman) -n $(Iterations)
+      displayName: Executar testes da API REST com Newman
+      condition: always() 
+    - script: |
+        cd /opt/mssql-tools/bin/
+        sqlcmd -S "127.0.0.1,1433" -U sa -P SqlServer2019! -d master -Q "USE BaseSuporte; SELECT * FROM dbo.Chamados;"
+      condition: always() 
+      displayName: Exibir registros criados na base de dados
+    - script: |
+        echo "** Versão Global do Newman **"
+        newman -v
+        npm install newman-reporter-htmlextra@1.22.11
+        npm install newman-reporter-junitfullreport@1.0.4
+      displayName:  Instalar packages newman-reporter-htmlextra e newman-reporter-junitfullreport
+      condition: always() 
+    - script: |
+        cd $(Path_Tests)
+        npx newman run $(Collection_Postman) -n $(Iterations) -r htmlextra,junitfullreport
+        cd ./newman
+        ls
+      displayName: Gerar resultados em HTML e XML dos testes da API REST com Newman
+      condition: always() 
+    - script: |
+        cd /opt/mssql-tools/bin/
+        sqlcmd -S "127.0.0.1,1433" -U sa -P SqlServer2019! -d master -Q "USE BaseSuporte; SELECT * FROM dbo.Chamados;"
+      condition: always() 
+      displayName: Exibir registros criados na base de dados após segundo conjunto de testes
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/newman/*.xml'
+        searchFolder: '$(Build.SourcesDirectory)'
+      displayName: Publicar sumário dos testes com base no XML gerado
+      condition: always()
+    - task: UploadPostmanHtmlReport@1
+      displayName: Publicar relatório em HTML com resultados dos testes da API REST com Newman
+      inputs:
+        cwd: '$(System.DefaultWorkingDirectory)/$(Path_Tests)'
+      condition: always()
+    - script: |
+        cd ./app
+        cat $(File_Log_Execution_WebApp)
+      displayName: Exibir log de execução da aplicação testada
+      condition: Always()
+    - task: Docker@2
+      displayName: Push para o Azure Container Registry
+      inputs:
+        containerRegistry: '$(dockerRegistryServiceConnection)'
+        repository: '$(imageRepository)'
+        command: 'push'
+        tags: |
+          $(tag)
+          latest
+
+    - upload: manifests
+      artifact: manifests
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: BuildAndTests
+
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'ChamadosSuporte.postmanefmigrations'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              secretName: $(imagePullSecret)
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+
+          - task: KubernetesManifest@0
+            displayName: Deploy no Azure Kubernetes Service (AKS)
+            inputs:
+              action: deploy
+              manifests: |
+                $(Pipeline.Workspace)/manifests/deployment.yml
+                $(Pipeline.Workspace)/manifests/service.yml
+              imagePullSecrets: |
+                $(imagePullSecret)
+              containers: |
+                $(containerRegistry)/$(imageRepository):$(tag)
